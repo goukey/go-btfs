@@ -1,6 +1,9 @@
 package config
 
 import (
+	"errors"
+
+	cfg "github.com/TRON-US/go-btfs-config"
 	"github.com/ethereum/go-ethereum/common"
 )
 
@@ -25,7 +28,7 @@ var (
 	tronOracleAddress  = common.HexToAddress("0x0c9de531dcb38b758fe8a2c163444a5e54ee0db2")
 	tronBatchAddress   = common.HexToAddress("0x0c9de531dcb38b758fe8a2c163444a5e54ee0db2")
 
-	bttcTestFactoryAddress    = common.HexToAddress("0x92D7877103bC445A028516ea538E1B6D160c1915")
+	bttcTestFactoryAddress    = common.HexToAddress("0xc4e269975e5277eA16c32023A5A70F96541ED854")
 	bttcTestOracleAddress     = common.HexToAddress("0xb2C746a9C81564bEF8382e885AF11e73De4a9E15")
 	bttcTestBatchAddress      = common.HexToAddress("0x0c9de531dcb38b758fe8a2c163444a5e54ee0db2")
 	bttcTestVaultLogicAddress = common.HexToAddress("0x212324b18255593AdE87597Fa37C2c582aD72d24")
@@ -109,13 +112,40 @@ func GetChainConfig(chainID int64) (*ChainConfig, bool) {
 		return &cfg, true
 
 	default:
-		cfg.StartBlock = bttcStartBlock
-		cfg.CurrentFactory = bttcTestFactoryAddress
-		cfg.PriceOracleAddress = bttcTestOracleAddress
-		cfg.DeploymentGas = bttcTestDeploymentGas
-		cfg.Endpoint = bttcTestEndpoint
-		cfg.BatchAddress = bttcTestBatchAddress
-		cfg.VaultLogicAddress = bttcTestVaultLogicAddress
-		return &cfg, true
+		return nil, false
 	}
+}
+
+func InitChainConfig(
+	cfg *cfg.Config,
+	stored bool,
+	chainid int64,
+) (*ChainConfig, error) {
+	if stored {
+		if cfg.ChainInfo.ChainId <= 0 {
+			return nil, errors.New("ChainId is None in config file")
+		}
+		if len(cfg.ChainInfo.CurrentFactory) <= 0 {
+			return nil, errors.New("CurrentFactory is None in config file")
+		}
+		if len(cfg.ChainInfo.PriceOracleAddress) <= 0 {
+			return nil, errors.New("PriceOracleAddress is None in config file")
+		}
+		if len(cfg.ChainInfo.Endpoint) <= 0 {
+			return nil, errors.New("Endpoint is None in config file")
+		}
+	}
+
+	chainconfig, found := GetChainConfig(chainid)
+	if !found {
+		return nil, errors.New("chainid is error, cannot find it")
+	}
+
+	if stored {
+		chainconfig.CurrentFactory = common.HexToAddress(cfg.ChainInfo.CurrentFactory)
+		chainconfig.PriceOracleAddress = common.HexToAddress(cfg.ChainInfo.PriceOracleAddress)
+		chainconfig.Endpoint = cfg.ChainInfo.Endpoint
+	}
+
+	return chainconfig, nil
 }

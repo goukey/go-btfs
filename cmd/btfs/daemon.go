@@ -26,6 +26,7 @@ import (
 	"github.com/bittorrent/go-btfs/bindata"
 	"github.com/bittorrent/go-btfs/chain"
 	cc "github.com/bittorrent/go-btfs/chain/config"
+	chainconfig "github.com/bittorrent/go-btfs/chain/config"
 	utilmain "github.com/bittorrent/go-btfs/cmd/btfs/util"
 	oldcmds "github.com/bittorrent/go-btfs/commands"
 	"github.com/bittorrent/go-btfs/core"
@@ -38,10 +39,10 @@ import (
 	libp2p "github.com/bittorrent/go-btfs/core/node/libp2p"
 	nodeMount "github.com/bittorrent/go-btfs/fuse/node"
 	fsrepo "github.com/bittorrent/go-btfs/repo/fsrepo"
-	migrate "github.com/bittorrent/go-btfs/repo/fsrepo/migrations"
 	"github.com/bittorrent/go-btfs/spin"
 	"github.com/bittorrent/go-btfs/transaction"
 	"github.com/bittorrent/go-btfs/transaction/crypto"
+	"github.com/bittorrent/go-btfs/transaction/storage"
 
 	multierror "github.com/hashicorp/go-multierror"
 	util "github.com/ipfs/go-ipfs-util"
@@ -314,39 +315,6 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 	switch err {
 	default:
 		return err
-	case fsrepo.ErrNeedMigration:
-		domigrate, found := req.Options[migrateKwd].(bool)
-		fmt.Println("Found outdated fs-repo, migrations need to be run.")
-
-		if !found {
-			domigrate = YesNoPrompt("Run migrations now? [y/N]")
-		}
-
-		if !domigrate {
-			fmt.Println("Not running migrations of fs-repo now.")
-			fmt.Println("Please get fs-repo-migrations from https://dist.ipfs.io")
-			return fmt.Errorf("fs-repo requires migration")
-		}
-
-		curPath, err := fsrepo.BestKnownPath()
-		if err != nil {
-			return err
-		}
-		// Set to get ipfs' fs-repo-migrations to work without hacks
-		os.Setenv("IPFS_PATH", curPath)
-		err = migrate.RunMigration(fsrepo.RepoVersion)
-		if err != nil {
-			fmt.Println("The migrations of fs-repo failed:")
-			fmt.Printf("  %s\n", err)
-			fmt.Println("If you think this is a bug, please file an issue and include this whole log output.")
-			fmt.Println("  https://github.com/ipfs/fs-repo-migrations")
-			return err
-		}
-
-		repo, err = fsrepo.Open(cctx.ConfigRoot)
-		if err != nil {
-			return err
-		}
 	case nil:
 		break
 	}
@@ -395,20 +363,20 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 		return err
 	}
 
-	chainid := cc.DefaultChain
+	chainid, stored, err := getChainID(req, cfg, statestore)
+	if err != nil {
+		return err
+	}
 
-	chainidstr, found := req.Options[chainID].(string)
-	if found {
-		chainid, err = strconv.ParseInt(chainidstr, 10, 64)
-		if err != nil {
-			return err
-		}
+	chainCfg, err := chainconfig.InitChainConfig(cfg, stored, chainid)
+	if err != nil {
+		return err
 	}
 
 	//endpoint
-	chainInfo, err := chain.InitChain(context.Background(), statestore, singer, time.Duration(1000000000), chainid, cfg.Identity.PeerID)
+	chainInfo, err := chain.InitChain(context.Background(), statestore, singer, time.Duration(1000000000),
+		chainid, cfg.Identity.PeerID, chainCfg)
 	if err != nil {
-		fmt.Println("init chain err: ", err)
 		return err
 	}
 
@@ -773,6 +741,60 @@ func serveHTTPApi(req *cmds.Request, cctx *oldcmds.Context) (<-chan error, error
 	}()
 
 	return errc, nil
+}
+
+func getInputChainID(req *cmds.Request) (chainid int64, err error) {
+	inputChainIdStr, found := req.Options[chainID].(string)
+	if found {
+		inputChainid, err := strconv.ParseInt(inputChainIdStr, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+
+		return inputChainid, nil
+	}
+	return 0, nil
+}
+
+func getChainID(req *cmds.Request, cfg *config.Config, stateStorer storage.StateStorer) (chainId int64, stored bool, err error) {
+	cfgChainId := cfg.ChainInfo.ChainId
+	inputChainId, err := getInputChainID(req)
+	if err != nil {
+		return 0, stored, err
+	}
+	storeChainid, err := chain.GetChainIdFromDisk(stateStorer)
+	if err != nil {
+		return 0, stored, err
+	}
+
+	chainId = cc.DefaultChain
+	//config chain version, must be have cfgChainId
+	if storeChainid > 0 {
+		// compare cfg chain id and leveldb chain id
+		if storeChainid != cfgChainId {
+			return 0, stored, errors.New(
+				fmt.Sprintf("current chainId=%d is different from config chainId=%d, "+
+					"you can not change chain id in config file", storeChainid, cfgChainId))
+		}
+
+		// compare input chain id and leveldb chain id
+		if inputChainId > 0 && storeChainid != inputChainId {
+			return 0, stored, errors.New(
+				fmt.Sprintf("current chainId=%d is different from input chainId=%d, "+
+					"you can not change chain id with --chain-id when node start", storeChainid, inputChainId))
+		}
+
+		chainId = storeChainid
+		stored = true
+	} else {
+		// old version, should be inputChainId first, DefaultChainId second.
+		if inputChainId > 0 {
+			chainId = inputChainId
+		}
+		stored = false
+	}
+
+	return chainId, stored, nil
 }
 
 // printSwarmAddrs prints the addresses of the host
