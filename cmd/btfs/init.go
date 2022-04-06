@@ -206,6 +206,7 @@ func doInit(out io.Writer, repoRoot string, empty bool, nBitsForKeypair int, con
 }
 
 // add chain id into leveldb
+// btfs init cmd, not node process
 func storeChainId(conf *config.Config, repoRoot string) error {
 	statestore, err := chain.InitStateStore(repoRoot)
 	if err != nil {
@@ -240,7 +241,7 @@ func addChainInfo(conf *config.Config) error {
 func addIdentityInfo(conf *config.Config, importKey string) error {
 	conf.Identity.HexPrivKey = importKey
 
-	bttcAddr, err := chain.GetBttcByKey(importKey)
+	bttcAddr, err := chain.GetBttcByKey(conf.Identity.PrivKey)
 	if err != nil {
 		return err
 	}

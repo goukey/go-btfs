@@ -7,6 +7,7 @@ import (
 	_ "expvar"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -38,11 +39,14 @@ import (
 	corerepo "github.com/bittorrent/go-btfs/core/corerepo"
 	libp2p "github.com/bittorrent/go-btfs/core/node/libp2p"
 	nodeMount "github.com/bittorrent/go-btfs/fuse/node"
+	"github.com/bittorrent/go-btfs/repo"
 	fsrepo "github.com/bittorrent/go-btfs/repo/fsrepo"
+	"github.com/bittorrent/go-btfs/settlement/swap/vault"
 	"github.com/bittorrent/go-btfs/spin"
 	"github.com/bittorrent/go-btfs/transaction"
 	"github.com/bittorrent/go-btfs/transaction/crypto"
 	"github.com/bittorrent/go-btfs/transaction/storage"
+	"github.com/ethereum/go-ethereum/common"
 
 	multierror "github.com/hashicorp/go-multierror"
 	util "github.com/ipfs/go-ipfs-util"
@@ -357,7 +361,8 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 	fmt.Println("the address of Tron format is: ", keys.Base58Address)
 
 	//chain init
-	statestore, err := chain.InitStateStore(cctx.ConfigRoot)
+	configRoot := cctx.ConfigRoot
+	statestore, err := chain.InitStateStore(configRoot)
 	if err != nil {
 		fmt.Println("init statestore err: ", err)
 		return err
@@ -367,10 +372,29 @@ func daemonFunc(req *cmds.Request, re cmds.ResponseEmitter, env cmds.Environment
 	if err != nil {
 		return err
 	}
-
 	chainCfg, err := chainconfig.InitChainConfig(cfg, stored, chainid)
 	if err != nil {
 		return err
+	}
+
+	// upgrade factory to v2 if necessary
+	needUpdateFactory := false
+	needUpdateFactory, err = doIfNeedUpgradeFactoryToV2(chainid, chainCfg, statestore, repo, cfg, configRoot)
+	if err != nil {
+		fmt.Printf("upgrade vault contract failed, err=%s\n", err)
+		return err
+	}
+	if needUpdateFactory { // no error means upgrade preparation done, re-init the statestore
+		statestore, err = chain.InitStateStore(configRoot)
+		if err != nil {
+			fmt.Println("init statestore err: ", err)
+			return err
+		}
+		err = chain.StoreChainIdIfNotExists(chainid, statestore)
+		if err != nil {
+			fmt.Printf("save chainid failed, err: %s\n", err)
+			return
+		}
 	}
 
 	//endpoint
@@ -770,23 +794,29 @@ func getChainID(req *cmds.Request, cfg *config.Config, stateStorer storage.State
 	chainId = cc.DefaultChain
 	//config chain version, must be have cfgChainId
 	if storeChainid > 0 {
-		// compare cfg chain id and leveldb chain id
-		if storeChainid != cfgChainId {
-			return 0, stored, errors.New(
-				fmt.Sprintf("current chainId=%d is different from config chainId=%d, "+
-					"you can not change chain id in config file", storeChainid, cfgChainId))
-		}
+		// on moving, from old version to new version, later must be sync info
+		if cfgChainId == 0 && cfg.ChainInfo.Endpoint == "" {
+			chainId = storeChainid
+			stored = false
+		} else { // not move, new version start.
+			// compare cfg chain id and leveldb chain id
+			if storeChainid != cfgChainId {
+				return 0, stored, errors.New(
+					fmt.Sprintf("current chainId=%d is different from config chainId=%d, "+
+						"you can not change chain id in config file", storeChainid, cfgChainId))
+			}
 
-		// compare input chain id and leveldb chain id
-		if inputChainId > 0 && storeChainid != inputChainId {
-			return 0, stored, errors.New(
-				fmt.Sprintf("current chainId=%d is different from input chainId=%d, "+
-					"you can not change chain id with --chain-id when node start", storeChainid, inputChainId))
-		}
+			// compare input chain id and leveldb chain id
+			if inputChainId > 0 && storeChainid != inputChainId {
+				return 0, stored, errors.New(
+					fmt.Sprintf("current chainId=%d is different from input chainId=%d, "+
+						"you can not change chain id with --chain-id when node start", storeChainid, inputChainId))
+			}
 
-		chainId = storeChainid
-		stored = true
-	} else {
+			chainId = storeChainid
+			stored = true
+		}
+	} else { // not move, old version start.
 		// old version, should be inputChainId first, DefaultChainId second.
 		if inputChainId > 0 {
 			chainId = inputChainId
@@ -1158,4 +1188,83 @@ func functest(statusServerDomain, peerId, hValue string) {
 	} else {
 		fmt.Printf("BTFS daemon test skipped\n")
 	}
+}
+
+// VaultFactory upgraded to V2, we need re-deploy a vault for user
+func doIfNeedUpgradeFactoryToV2(chainid int64, chainCfg *chainconfig.ChainConfig, statestore storage.StateStorer, repo repo.Repo, cfg *config.Config, configRoot string) (need bool, err error) {
+
+	currChainCfg, ok := chainconfig.GetChainConfig(chainid)
+	if !ok {
+		err = errors.New(fmt.Sprintf("chain %d is not supported yet", chainid))
+		return
+	}
+
+	confFactory := cfg.ChainInfo.CurrentFactory      // Factory address from config file, may be ""
+	currFactory := currChainCfg.CurrentFactory.Hex() // Factory address read from source code
+	if !chainconfig.IsV2FactoryAddr(currFactory) {
+		return
+	}
+
+	// calculate whether need to upgrade factory to v2
+	if confFactory == "" {
+		need = true
+	} else {
+		if confFactory == currFactory {
+			need = false
+		} else {
+			need = chainconfig.IsV1FactoryAddr(confFactory)
+		}
+	}
+	if !need {
+		return
+	}
+
+	fmt.Println("prepare upgrading your vault contract")
+
+	oldVault, err := vault.GetStoredVaultAddr(statestore)
+	if err != nil {
+		return
+	}
+
+	// backup `statestore` folder
+	err = statestore.Close()
+	if err != nil {
+		return
+	}
+
+	bkSuffix := fmt.Sprintf("backup%d", rand.Intn(100))
+	err = chain.BackUpStateStore(configRoot, bkSuffix)
+	if err != nil {
+		return
+	}
+
+	// backup `config` file
+	var bkConfig string
+	bkConfig, err = repo.BackUpConfigV2(bkSuffix)
+	if err != nil {
+		fmt.Printf("backup config file failed, err: %s\n", err)
+		return
+	}
+	fmt.Printf("backup config file successfully to %s\n", bkConfig)
+
+	// update factory address and other chain info to config file.
+	// note that we only changed the `CurrentFactory`, so we won't overide other chaininfo field in the config file.
+	chainCfg.CurrentFactory = common.HexToAddress(currFactory)
+
+	cfg.ChainInfo.ChainId = chainid // set these fields here is a little tricky
+	cfg.ChainInfo.Endpoint = chainCfg.Endpoint
+	cfg.ChainInfo.CurrentFactory = chainCfg.CurrentFactory.Hex()
+	cfg.ChainInfo.PriceOracleAddress = chainCfg.PriceOracleAddress.Hex()
+
+	err = commands.SyncConfigChainInfoV2(configRoot, chainid, chainCfg.Endpoint, chainCfg.CurrentFactory, chainCfg.PriceOracleAddress)
+	if err != nil {
+		return
+	}
+
+	zeroaddr := common.Address{}
+	if oldVault != zeroaddr {
+		fmt.Printf("your old vault address is %s\n", oldVault)
+	}
+	fmt.Println("will re-deploy a vault contract for you")
+	return
 }
