@@ -7,6 +7,7 @@ import (
 	"errors"
 	_ "expvar"
 	"fmt"
+	"github.com/bittorrent/go-btfs/chain/tokencfg"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -354,6 +355,10 @@ If the user need to start multiple nodes on the same machine, the configuration 
 
 	if !inited {
 		migrated := config.MigrateConfig(cfg, false, hasHval)
+		if cfg.ChainInfo.PriceOracleAddress != "" {
+			cfg.ChainInfo.PriceOracleAddress = ""
+			migrated = true
+		}
 		if migrated {
 			// Flush changes if migrated
 			err = repo.SetConfig(cfg)
@@ -443,6 +448,8 @@ If the user need to start multiple nodes on the same machine, the configuration 
 		}
 	}
 
+	tokencfg.InitToken(chainid)
+
 	//endpoint
 	chainInfo, err := chain.InitChain(context.Background(), statestore, singer, time.Duration(1000000000),
 		chainid, cfg.Identity.PeerID, chainCfg)
@@ -471,7 +478,7 @@ If the user need to start multiple nodes on the same machine, the configuration 
 	}
 
 	/*settleinfo*/
-	_, err = chain.InitSettlement(context.Background(), statestore, chainInfo, deployGasPrice, chainInfo.ChainID)
+	settleInfo, err := chain.InitSettlement(context.Background(), statestore, chainInfo, deployGasPrice, chainInfo.ChainID)
 	if err != nil {
 		fmt.Println("init settlement err: ", err)
 		if strings.Contains(err.Error(), "insufficient funds") {
@@ -485,9 +492,31 @@ If the user need to start multiple nodes on the same machine, the configuration 
 		return err
 	}
 
+	/*upgrade vault implementation*/
+	oldImpl, newImpl, err := settleInfo.VaultService.UpgradeTo(context.Background(), chainInfo.Chainconfig.VaultLogicAddress)
+	if err != nil {
+		emsg := err.Error()
+		if strings.Contains(emsg, "already upgraded") {
+			fmt.Printf("vault implementation is updated: %s\n", chainInfo.Chainconfig.VaultLogicAddress)
+			err = nil
+		} else {
+			fmt.Println("upgrade vault implementation err: ", err)
+			return err
+		}
+	} else {
+		fmt.Printf("vault logic implementation upgrade from %s to %s\n", oldImpl, newImpl)
+	}
+
 	// init report status contract
-	reportStatusServ := reportstatus.Init(chainInfo.TransactionService, cfg, chainCfg.StatusAddress)
-	err = CheckExistLastOnlineReport(cfg, configRoot, chainid, reportStatusServ)
+	//reportStatusServ := reportstatus.Init(chainInfo.TransactionService, cfg, chainCfg.StatusAddress)
+	//err = CheckExistLastOnlineReport(cfg, configRoot, chainid, reportStatusServ)
+	//if err != nil {
+	//	fmt.Println("check report status, err: ", err)
+	//	return err
+	//}
+
+	// init report online info
+	err = CheckExistLastOnlineReportV2(cfg, configRoot, chainid)
 	if err != nil {
 		fmt.Println("check report status, err: ", err)
 		return err
@@ -1384,5 +1413,41 @@ func CheckHubDomainConfig(cfg *config.Config, configRoot string, chainId int64) 
 		}
 	}
 
+	return nil
+}
+
+// CheckExistLastOnlineReportV2 sync conf and lastOnlineInfo
+func CheckExistLastOnlineReportV2(cfg *config.Config, configRoot string, chainId int64) error {
+	lastOnline, err := chain.GetLastOnline()
+	if err != nil {
+		return err
+	}
+
+	// if nil, set config online status config
+	if lastOnline == nil {
+		var reportOnline bool
+		if cfg.Experimental.StorageHostEnabled {
+			reportOnline = true
+		}
+
+		var onlineServerDomain string
+		if chainId == 199 {
+			onlineServerDomain = config.DefaultServicesConfig().OnlineServerDomain
+		} else {
+			onlineServerDomain = config.DefaultServicesConfigTestnet().OnlineServerDomain
+		}
+
+		err = commands.SyncConfigOnlineCfgV2(configRoot, onlineServerDomain, reportOnline)
+		if err != nil {
+			return err
+		}
+	}
+
+	// if nil, set last online info
+	if lastOnline == nil {
+		if err != spin.GetLastOnlineInfoWhenNodeMigration(context.Background(), cfg) {
+			return err
+		}
+	}
 	return nil
 }
